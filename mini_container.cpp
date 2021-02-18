@@ -1,10 +1,13 @@
-#include <sys/wait.h>
+#include <limits.h>
 #include <sys/mount.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 
 #include <boost/program_options.hpp>
 #include <iostream>
 #include <sstream>
+
+#define NIS_DOMAIN_NAME_MAX (64)
 
 void errExit(const char* msg) {
   perror(msg);
@@ -12,6 +15,22 @@ void errExit(const char* msg) {
 }
 
 namespace po = boost::program_options;
+
+std::string getHostname() {
+  char hostname[HOST_NAME_MAX];
+  if (gethostname(hostname, HOST_NAME_MAX) != 0) {
+    errExit("gethostname");
+  }
+  return std::string(hostname);
+}
+
+std::string getNisDomainName() {
+  char domainname[NIS_DOMAIN_NAME_MAX];
+  if (getdomainname(domainname, NIS_DOMAIN_NAME_MAX) != 0) {
+    errExit("getdomainname");
+  }
+  return std::string(domainname);
+}
 
 void runContainer(const std::string& cmd) {
   std::istringstream iss(cmd);
@@ -25,6 +44,10 @@ void runContainer(const std::string& cmd) {
   args.push_back(nullptr);
 
   std::cout << "[Container] Running command: " << cmd << std::endl;
+  std::cout << "[Container] Container hostname: " << getHostname()
+            << std::endl;
+  std::cout << "[Container] Container NIS domain name: "
+            << getNisDomainName() << std::endl;
   execv(tokens[0].c_str(), args.data());
 
   errExit("execv failed");  // Only reached if execv() fails
@@ -101,16 +124,36 @@ void setupFilesystem(const std::string& rootfs) {
   }
 }
 
+void setHostAndDomainName(
+    const std::string& hostname,
+    const std::string& nisDomainName) {
+  if (!hostname.empty() &&
+      sethostname(hostname.c_str(), hostname.length()) != 0) {
+    errExit("sethostname");
+  }
+  if (!nisDomainName.empty() &&
+      setdomainname(nisDomainName.c_str(), nisDomainName.length()) != 0) {
+    errExit("setdomainname");
+  }
+}
+
 int main(int argc, char** argv) {
   std::string rootfs;
+  std::string hostname;
+  std::string domain;
   bool enablePid = false;
+
   po::options_description options{"Options"};
   options.add_options()
     ("help,h", "Print help message")
     ("rootfs,r", po::value<std::string>(&rootfs),
-      "Root filesystem path of the container")
-    ("pid,p", po::value<bool>(&enablePid),
-      "Enable PID isolation");
+     "Root filesystem path of the container")
+    ("pid,p", po::bool_switch(&enablePid)->default_value(false),
+     "Enable PID isolation")
+    ("hostname,h", po::value<std::string>(&hostname),
+     "Hostname of the container")
+    ("domain,d", po::value<std::string>(&domain),
+     "NIS domain name of the container");
 
   std::string cmd;
   po::options_description hiddenOptions{"Hidden Options"};
@@ -149,6 +192,9 @@ int main(int argc, char** argv) {
   if (enablePid) {
     flags |= CLONE_NEWPID;
   }
+  if (!hostname.empty() || !domain.empty()) {
+    flags |= CLONE_NEWUTS;
+  }
 
   // We need to make a raw syscall because we need something like fork(flags)
   // but there is no such wrapper available. In other words, we need to fork
@@ -170,11 +216,15 @@ int main(int argc, char** argv) {
   if (cpid == 0) {
     // Container
     setupFilesystem(rootfs);
+    setHostAndDomainName(hostname, domain);
     runContainer(cmd);
   } else {
     // Agent
     std::cout << "[Agent] Container pid: " << cpid << std::endl;
     std::cout << "[Agent] Agent pid: " << getpid() << std::endl;
+    std::cout << "[Agent] Agent hostname: " << getHostname() << std::endl;
+    std::cout << "[Agent] Agent NIS domain name: " << getNisDomainName()
+              << std::endl;
     if (waitpid(cpid, NULL, 0) == -1) {
       errExit("waitpid failed");
     }
