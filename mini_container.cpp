@@ -1,4 +1,5 @@
 #include <sys/wait.h>
+#include <sys/mount.h>
 
 #include <boost/program_options.hpp>
 #include <iostream>
@@ -28,9 +29,84 @@ void runContainer(const std::string& cmd) {
   errExit("execv failed");  // Only reached if execv() fails
 }
 
+void setupFilesystem(const std::string& rootfs) {
+  if (rootfs.empty()) {
+    return;
+  }
+  // (1) Create a new namespace
+  if (unshare(CLONE_NEWNS) == -1) {
+    errExit("unshare(CLONE_NEWNS)");
+  }
+  // (2) Change the propagation type of all mount points to MS_SLAVE.
+  // Equivalent to "mount --make-rslave /"
+  if (mount(
+        "" /* source: IGNORED */,
+        "/" /* target */,
+        nullptr /* filesystemtype: IGNORED*/,
+        MS_SLAVE | MS_REC /* mountflags */,
+        nullptr /* data: IGNORED*/) == -1) {
+    errExit("mount(/, MS_SLAVE | MS_REC)");
+  }
+
+  // (3) Bind mount rootfs to itself so that it becomes a mount point.
+  // Because the source of a mount move must be a mount point.
+  if (mount(
+        rootfs.c_str() /* source */,
+        rootfs.c_str() /* target */,
+        nullptr /* filesystemtype: IGNORED*/,
+        MS_BIND | MS_REC /* mountflags */,
+        nullptr /* data: IGNORED*/) == -1) {
+    errExit("mount(rootfs, rootfs, MS_BIND | MS_REC)");
+  }
+
+  // (4) Enter rootfs
+  if (chdir(rootfs.c_str()) == -1) {
+    errExit("chdir(rootfs)");
+  }
+  // (5) Mount move rootfs to "/".
+  if (mount(
+        rootfs.c_str() /* source */,
+        "/" /* target */,
+        nullptr /* filesystemtype: IGNORED*/,
+        MS_MOVE /* mountflags */,
+        nullptr /* data: IGNORED*/) == -1) {
+    errExit("mount(rootfs, /, MS_MOVE)");
+  }
+  // (6) Change the container's root to rootfs
+  if (chroot(".") == -1) {
+    errExit("chroot(\".\")");
+  }
+  // (7) Change current directory to "/"
+  if (chdir("/") == -1) {
+    errExit("chdir(\"/\")");
+  }
+  // (8) Let any changes in the container propagae to its children if any
+  if (mount(
+        "" /* source: IGNORED */,
+        "/" /* target */,
+        nullptr /* filesystemtype: IGNORED*/,
+        MS_SHARED | MS_REC /* mountflags */,
+        nullptr /* data: IGNORED*/) == -1) {
+    errExit("mount(/, MS_SHARED | MS_REC)");
+  }
+  // (9) Mount procfs for the container
+  if (mount(
+        "proc" /* source */,
+        "/proc" /* target */,
+        "proc" /* filesystemtype */,
+        MS_NOSUID | MS_NOEXEC | MS_NODEV /* mountflags */,
+        nullptr /* data: IGNORED*/) == -1) {
+    errExit("mount(proc, /proc, MS_NOSUID | MS_NOEXEC | MS_NODEV)");
+  }
+}
+
 int main(int argc, char** argv) {
+  std::string rootfs;
   po::options_description options{"Options"};
-  options.add_options()("help,h", "Print help message");
+  options.add_options()
+    ("help,h", "Print help message")
+    ("rootfs,r", po::value<std::string>(&rootfs),
+      "Root filesystem path of the container");
 
   std::string cmd;
   po::options_description hiddenOptions{"Hidden Options"};
@@ -69,6 +145,7 @@ int main(int argc, char** argv) {
 
   if (cpid == 0) {
     // Container
+    setupFilesystem(rootfs);
     runContainer(cmd);
   } else {
     // Agent
