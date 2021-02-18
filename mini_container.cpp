@@ -1,5 +1,6 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
+#include <sys/syscall.h>
 
 #include <boost/program_options.hpp>
 #include <iostream>
@@ -102,11 +103,14 @@ void setupFilesystem(const std::string& rootfs) {
 
 int main(int argc, char** argv) {
   std::string rootfs;
+  bool enablePid = false;
   po::options_description options{"Options"};
   options.add_options()
     ("help,h", "Print help message")
     ("rootfs,r", po::value<std::string>(&rootfs),
-      "Root filesystem path of the container");
+      "Root filesystem path of the container")
+    ("pid,p", po::value<bool>(&enablePid),
+      "Enable PID isolation");
 
   std::string cmd;
   po::options_description hiddenOptions{"Hidden Options"};
@@ -138,7 +142,27 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  int cpid = fork();
+  int flags = SIGCHLD;
+  if (!rootfs.empty()) {
+    flags |= CLONE_NEWNS;
+  }
+  if (enablePid) {
+    flags |= CLONE_NEWPID;
+  }
+
+  // We need to make a raw syscall because we need something like fork(flags)
+  // but there is no such wrapper available. In other words, we need to fork
+  // current process and create namespaces specified by flags.
+  //
+  // See https://www.man7.org/linux/man-pages/man2/clone.2.html for this raw
+  // syscall signature. This order actually assumes it's on x86-64.
+  int cpid = syscall(
+      SYS_clone,
+      flags,
+      nullptr /*stack*/,
+      nullptr /*parent_tid*/,
+      nullptr /*child_tid*/,
+      0 /*tls: only meaningful if CLONE_SETTLS flag is set*/);
   if (cpid == -1) {
     errExit("fork failed");
   }
