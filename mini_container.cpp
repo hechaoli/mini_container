@@ -142,6 +142,7 @@ int main(int argc, char** argv) {
   std::string hostname;
   std::string domain;
   bool enablePid = false;
+  bool enableIpc = false;
 
   po::options_description options{"Options"};
   options.add_options()
@@ -153,7 +154,9 @@ int main(int argc, char** argv) {
     ("hostname,h", po::value<std::string>(&hostname),
      "Hostname of the container")
     ("domain,d", po::value<std::string>(&domain),
-     "NIS domain name of the container");
+     "NIS domain name of the container")
+    ("ipc,i", po::bool_switch(&enableIpc),
+     "Enable IPC isolation");
 
   std::string cmd;
   po::options_description hiddenOptions{"Hidden Options"};
@@ -194,6 +197,9 @@ int main(int argc, char** argv) {
   }
   if (!hostname.empty() || !domain.empty()) {
     flags |= CLONE_NEWUTS;
+  }
+  if (enableIpc) {
+    flags |= CLONE_NEWIPC;
   }
 
   // We need to make a raw syscall because we need something like fork(flags)
