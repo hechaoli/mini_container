@@ -16,6 +16,10 @@ void errExit(const char* msg) {
 
 namespace po = boost::program_options;
 
+const std::string kDefaultBridgeName = "br0";
+const std::string kDefaultBridgeIp = "10.0.0.1";
+const std::string kDefaultBridgePrefixLen = "16";
+
 std::string getHostname() {
   char hostname[HOST_NAME_MAX];
   if (gethostname(hostname, HOST_NAME_MAX) != 0) {
@@ -137,10 +141,91 @@ void setHostAndDomainName(
   }
 }
 
+// Called in parent (agent) process.
+void prepareNetwork(int containerPid) {
+  // (1) Create the default bridge if it doesn't exist.
+  std::string cmd = "ip link add name " + kDefaultBridgeName + " type bridge";
+  system(cmd.c_str());
+
+  // (2) Make sure the bridge is up.
+  cmd = "ip link set " + kDefaultBridgeName + " up";
+  if (system(cmd.c_str()) != 0) {
+    errExit("setting default bridge up failed");
+  }
+
+  // (3) Add IP to the bridge if it doesn't exist.
+  cmd = "ip addr add " + kDefaultBridgeIp + "/" + kDefaultBridgePrefixLen +
+        " brd + dev " + kDefaultBridgeName;
+  system(cmd.c_str());
+
+  // (4) Create a veth pair between host and container
+  // The veth interface name on the host is int the format "veth<container_pid>"
+  const std::string vethName = "veth" + std::to_string(containerPid);
+  cmd = "ip link add " + vethName + " type veth peer name eth0 netns " +
+        std::to_string(containerPid);
+  if (system(cmd.c_str()) != 0) {
+    errExit("adding veth pair failed");
+  }
+
+  // (5) Bring up the veth interface
+  cmd = "ip link set " + vethName + " up";
+  if (system(cmd.c_str()) != 0) {
+    errExit("setting veth up failed");
+  }
+
+  // (6) Add the veth interface as a port of the bridge
+  cmd = "ip link set " + vethName + " master " + kDefaultBridgeName;
+  if (system(cmd.c_str()) != 0) {
+    errExit("adding veth to bridge failed");
+  }
+
+  // (7) Enable IP forwarding
+  cmd = "sysctl -w net.ipv4.ip_forward=1";
+  if (system(cmd.c_str()) != 0) {
+    errExit("enabling net.ipv4.ip_forward failed");
+  }
+
+  // (8) Enable NAT
+  cmd = "iptables -t nat -A POSTROUTING -s " + kDefaultBridgeIp + "/" +
+        kDefaultBridgePrefixLen + " -j MASQUERADE";
+  if (system(cmd.c_str()) != 0) {
+    errExit("enabling NAT failed");
+  }
+}
+
+// Called in child (container) process
+void setupNetwork(const std::string& ip) {
+  // (1) Bring up lo interface
+  std::string cmd = "ip link set dev lo up";
+  if (system(cmd.c_str()) != 0) {
+    errExit("bring up lo device failed");
+  }
+
+  // (2) Add IP to eth0
+  cmd = "ip addr add " + ip + "/" + kDefaultBridgePrefixLen + " dev eth0";
+  if (system(cmd.c_str()) != 0) {
+    errExit("adding IP to eth0 failed");
+  }
+
+  // (3) Bring up eth0 interface
+  cmd = "ip link set dev eth0 up";
+  if (system(cmd.c_str()) != 0) {
+    errExit("bring up eth0 failed");
+  }
+
+  // (4) Set default gateway
+  cmd = "ip route add default via " + kDefaultBridgeIp;
+  if (system(cmd.c_str()) != 0) {
+    errExit("setting default gateway failed");
+  }
+}
+
 int main(int argc, char** argv) {
   std::string rootfs;
   std::string hostname;
   std::string domain;
+  std::string ip;
+
   bool enablePid = false;
   bool enableIpc = false;
 
@@ -156,7 +241,10 @@ int main(int argc, char** argv) {
     ("domain,d", po::value<std::string>(&domain),
      "NIS domain name of the container")
     ("ipc,i", po::bool_switch(&enableIpc),
-     "Enable IPC isolation");
+     "Enable IPC isolation")
+    // TODO: Dynamically allocate IP address.
+    ("ip", po::value<std::string>(&ip),
+     "IP of the container");
 
   std::string cmd;
   po::options_description hiddenOptions{"Hidden Options"};
@@ -201,6 +289,18 @@ int main(int argc, char** argv) {
   if (enableIpc) {
     flags |= CLONE_NEWIPC;
   }
+  if (!ip.empty()) {
+    // TODO: Validate the IP address and make sure it belongs to the default
+    // bridge network
+    flags |= CLONE_NEWNET;
+  }
+
+  int pipefd[2];
+  if (pipe(pipefd) != 0) {
+    errExit("pipe failed");
+  }
+  int readfd = pipefd[0];
+  int writefd = pipefd[1];
 
   // We need to make a raw syscall because we need something like fork(flags)
   // but there is no such wrapper available. In other words, we need to fork
@@ -221,6 +321,19 @@ int main(int argc, char** argv) {
 
   if (cpid == 0) {
     // Container
+    if (!ip.empty()) {
+      std::cout << "[Container] Waiting for agent to prepare the network ..."
+                << std::endl;
+      char buf;
+      read(readfd, &buf, 1);
+
+      std::cout << "[Container] Setting up container network ..." << std::endl;
+      setupNetwork(ip);
+      std::cout << "[Container] Done setting up container network" << std::endl;
+    }
+    close(readfd);
+    close(writefd);
+
     setupFilesystem(rootfs);
     setHostAndDomainName(hostname, domain);
     runContainer(cmd);
@@ -231,6 +344,16 @@ int main(int argc, char** argv) {
     std::cout << "[Agent] Agent hostname: " << getHostname() << std::endl;
     std::cout << "[Agent] Agent NIS domain name: " << getNisDomainName()
               << std::endl;
+    if (!ip.empty()) {
+      std::cout << "[Agent] Preparing network for container ..." << std::endl;
+      prepareNetwork(cpid);
+      std::cout << "[Agent] Done preparing network for container" << std::endl;
+      char buf = 0;
+      write(writefd, &buf, 1);
+    }
+    close(readfd);
+    close(writefd);
+
     if (waitpid(cpid, NULL, 0) == -1) {
       errExit("waitpid failed");
     }
