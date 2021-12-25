@@ -1,9 +1,11 @@
 #include <limits.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
 #include <boost/program_options.hpp>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 
@@ -19,6 +21,15 @@ namespace po = boost::program_options;
 const std::string kDefaultBridgeName = "br0";
 const std::string kDefaultBridgeIp = "10.0.0.1";
 const std::string kDefaultBridgePrefixLen = "16";
+
+// The code assumes this cgroup already exists and all controllers are enabled.
+const std::string kCgroupRoot = "/sys/fs/cgroup/mini_container/";
+bool verbose = false;
+
+struct ResourceLimit {
+  long long maxRamBytes;
+  ResourceLimit() : maxRamBytes(0) {}
+};
 
 std::string getHostname() {
   char hostname[HOST_NAME_MAX];
@@ -47,12 +58,14 @@ void runContainer(const std::string& cmd) {
   }
   args.push_back(nullptr);
 
-  std::cout << "[Container] Running command: " << cmd << std::endl;
-  std::cout << "[Container] Container hostname: " << getHostname()
-            << std::endl;
-  std::cout << "[Container] Container NIS domain name: "
-            << getNisDomainName() << std::endl;
-  execv(tokens[0].c_str(), args.data());
+  if (verbose) {
+    std::cout << "[Container] Running command: " << cmd << std::endl;
+    std::cout << "[Container] Container hostname: " << getHostname()
+              << std::endl;
+    std::cout << "[Container] Container NIS domain name: "
+              << getNisDomainName() << std::endl;
+    execv(tokens[0].c_str(), args.data());
+  }
 
   errExit("execv failed");  // Only reached if execv() fails
 }
@@ -220,6 +233,76 @@ void setupNetwork(const std::string& ip) {
   }
 }
 
+
+bool writeToFile(const std::string& file, const std::string& data) {
+  std::ofstream ofs(file);
+  if (ofs.is_open()) {
+    ofs << data;
+    ofs.close();
+  } else {
+    std::cout << "Error: Failed to open " << file << std::endl;
+    return false;
+  }
+  return true;
+}
+
+std::string getContainerCgroup(int cpid) {
+  return kCgroupRoot + std::to_string(cpid);
+}
+
+bool setupCgroup(int cpid, const ResourceLimit& limit) {
+  // (1) Create a cgroup at <root>/<cpid>
+  const std::string cgroupPath = getContainerCgroup(cpid);
+  if (mkdir(cgroupPath.c_str(), 0755) == -1) {
+    perror("mkdir(cgroupPath.c_str(), 0755)");
+    return false;
+  }
+
+  // (2) Set up resource limit
+  // Memory
+  if (limit.maxRamBytes > 0) {
+    // Try not to reclaim before hitting 75% of the max limit
+    int memoryLow = limit.maxRamBytes * 75 / 100;
+    int memoryMax = limit.maxRamBytes;
+    if (!writeToFile(cgroupPath + "/memory.low", std::to_string(memoryLow))) {
+      return false;
+    }
+    if (!writeToFile(cgroupPath + "/memory.max", std::to_string(memoryMax))) {
+      return false;
+    }
+  }
+
+  // (3) Move the container process to the cgroup
+  return writeToFile(cgroupPath + "/cgroup.procs", std::to_string(cpid));
+}
+
+void removeCgroup(const std::string& cgroupPath) {
+  if (rmdir(cgroupPath.c_str()) == -1) {
+    errExit("rmdir(cgroupPath)");
+  }
+}
+
+void waitForAgent(int pipefd[2]) {
+  // Close unused write end of the pipe
+  if (close(pipefd[1]) == -1) {
+    errExit("[Container] close(pipefd[1])");
+  }
+  int ret = 0;
+  bool success = false;
+  // Wait until agent writes to the pipe
+  do {
+    ret = read(pipefd[0], &success, sizeof(success));
+  } while (ret == -1 && errno == EINTR);
+  if (ret != sizeof(success) || !success) {
+    errExit("[Container] Preparation failed");
+  }
+
+  // Read end of the pipe is no longer needed. Close it.
+  if (close(pipefd[0]) == -1) {
+    errExit("[Container] close(pipefd[0])");
+  }
+}
+
 int main(int argc, char** argv) {
   std::string rootfs;
   std::string hostname;
@@ -229,9 +312,13 @@ int main(int argc, char** argv) {
   bool enablePid = false;
   bool enableIpc = false;
 
+  ResourceLimit limit;
+
   po::options_description options{"Options"};
   options.add_options()
     ("help,h", "Print help message")
+    ("verbose,v", po::bool_switch(&verbose)->default_value(false),
+     "Enable verose logging")
     ("rootfs,r", po::value<std::string>(&rootfs),
      "Root filesystem path of the container")
     ("pid,p", po::bool_switch(&enablePid)->default_value(false),
@@ -244,7 +331,9 @@ int main(int argc, char** argv) {
      "Enable IPC isolation")
     // TODO: Dynamically allocate IP address.
     ("ip", po::value<std::string>(&ip),
-     "IP of the container");
+     "IP of the container")
+    ("max-ram,R", po::value<long long>(&limit.maxRamBytes),
+     "The max amount of ram (in bytes) that the container can use");
 
   std::string cmd;
   po::options_description hiddenOptions{"Hidden Options"};
@@ -321,42 +410,58 @@ int main(int argc, char** argv) {
 
   if (cpid == 0) {
     // Container
-    if (!ip.empty()) {
-      std::cout << "[Container] Waiting for agent to prepare the network ..."
-                << std::endl;
-      char buf;
-      read(readfd, &buf, 1);
+    std::cout << "[Container] Waiting for agent to finish preparation ..."
+              << std::endl;
+    waitForAgent(pipefd);
 
+    if (!ip.empty()) {
       std::cout << "[Container] Setting up container network ..." << std::endl;
       setupNetwork(ip);
       std::cout << "[Container] Done setting up container network" << std::endl;
     }
-    close(readfd);
-    close(writefd);
 
     setupFilesystem(rootfs);
     setHostAndDomainName(hostname, domain);
     runContainer(cmd);
   } else {
     // Agent
-    std::cout << "[Agent] Container pid: " << cpid << std::endl;
-    std::cout << "[Agent] Agent pid: " << getpid() << std::endl;
-    std::cout << "[Agent] Agent hostname: " << getHostname() << std::endl;
-    std::cout << "[Agent] Agent NIS domain name: " << getNisDomainName()
-              << std::endl;
+    if (verbose) {
+      std::cout << "[Agent] Container pid: " << cpid << std::endl;
+      std::cout << "[Agent] Agent pid: " << getpid() << std::endl;
+      std::cout << "[Agent] Agent hostname: " << getHostname() << std::endl;
+      std::cout << "[Agent] Agent NIS domain name: " << getNisDomainName()
+                << std::endl;
+    }
     if (!ip.empty()) {
       std::cout << "[Agent] Preparing network for container ..." << std::endl;
       prepareNetwork(cpid);
       std::cout << "[Agent] Done preparing network for container" << std::endl;
-      char buf = 0;
-      write(writefd, &buf, 1);
     }
-    close(readfd);
-    close(writefd);
 
-    if (waitpid(cpid, NULL, 0) == -1) {
-      errExit("waitpid failed");
+    bool success = setupCgroup(cpid, limit);
+
+    // Close unused read end of the pipe
+    if (close(readfd) == -1) {
+      errExit("[Agent] close(readfd)");
     }
+    // Notify the container to continue
+    if (write(writefd, &success, sizeof(success)) == -1) {
+      errExit("[Agent] write(writefd)");
+    }
+    // Close write end of the pipe
+    if (close(writefd) == -1) {
+      errExit("[Agent] close(writefd)");
+    }
+
+    int status;
+    if (waitpid(cpid, &status, 0) == -1) {
+      errExit("[Agent] waitpid failed");
+    }
+    if (verbose) {
+      std::cout << "[Agent] The container exited with status: " << status
+                << std::endl;
+    }
+    removeCgroup(getContainerCgroup(cpid));
   }
 
   return 0;
